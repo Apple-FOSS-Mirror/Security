@@ -42,7 +42,7 @@
 #include "secoid.h"
 #include <security_asn1/secasn1.h>
 #include <security_asn1/secerr.h>
-
+#include <security_asn1/secport.h>
 
 extern const SecAsn1Template nss_cms_set_of_attribute_template[];
 
@@ -61,7 +61,7 @@ SEC_ASN1_MKSUB(kSecAsn1SetOfAnyTemplate)
 
 /* forward declaration */
 static const SecAsn1Template *
-nss_cms_choose_content_template(void *src_or_dest, Boolean encoding, const char *buf, void *dest);
+nss_cms_choose_content_template(void *src_or_dest, Boolean encoding, const char *buf, size_t len, void *dest);
 
 static const SecAsn1TemplateChooserPtr nss_cms_chooser
 	= nss_cms_choose_content_template;
@@ -253,10 +253,9 @@ static const SecAsn1Template SecCmsRecipientIdentifierTemplate[] = {
     { SEC_ASN1_CHOICE,
 	  offsetof(SecCmsRecipientIdentifier,identifierType), NULL,
 	  sizeof(SecCmsRecipientIdentifier) },
-    { SEC_ASN1_EXPLICIT | SEC_ASN1_CONSTRUCTED | SEC_ASN1_CONTEXT_SPECIFIC |
-      SEC_ASN1_XTRN | 0,
+    { SEC_ASN1_POINTER | SEC_ASN1_CONTEXT_SPECIFIC | SEC_ASN1_XTRN | 0,
 	  offsetof(SecCmsRecipientIdentifier,id.subjectKeyID),
-	  SEC_ASN1_SUB(kSecAsn1PointerToOctetStringTemplate) ,
+	  SEC_ASN1_SUB(kSecAsn1OctetStringTemplate) ,
 	  SecCmsRecipientIDSubjectKeyID },
     { SEC_ASN1_POINTER | SEC_ASN1_XTRN,
 	  offsetof(SecCmsRecipientIdentifier,id.issuerAndSN),
@@ -308,10 +307,9 @@ static const SecAsn1Template SecCmsOriginatorIdentifierOrKeyTemplate[] = {
 	  SEC_ASN1_SUB(SecCmsIssuerAndSNTemplate),
 	  SecCmsOriginatorIDOrKeyIssuerSN },
     { SEC_ASN1_EXPLICIT | SEC_ASN1_CONSTRUCTED | SEC_ASN1_CONTEXT_SPECIFIC |
-      /* this was tag 1 here, 2 for the next; RFC 3852 says they are 0 and 1 */
       SEC_ASN1_XTRN | 0,
 	  offsetof(SecCmsOriginatorIdentifierOrKey,id.subjectKeyID),
-	  kSecAsn1OctetStringTemplate,
+	  SEC_ASN1_SUB(kSecAsn1PointerToOctetStringTemplate) ,
 	  SecCmsOriginatorIDOrKeySubjectKeyID },
     { SEC_ASN1_EXPLICIT | SEC_ASN1_CONSTRUCTED | SEC_ASN1_CONTEXT_SPECIFIC | 1,
 	  offsetof(SecCmsOriginatorIdentifierOrKey,id.originatorPublicKey),
@@ -323,11 +321,13 @@ static const SecAsn1Template SecCmsOriginatorIdentifierOrKeyTemplate[] = {
 const SecAsn1Template SecCmsRecipientKeyIdentifierTemplate[] = {
     { SEC_ASN1_SEQUENCE,
 	  0, NULL, sizeof(SecCmsRecipientKeyIdentifier) },
-    { SEC_ASN1_OCTET_STRING,
-	  offsetof(SecCmsRecipientKeyIdentifier,subjectKeyIdentifier) },
-    { SEC_ASN1_OPTIONAL | SEC_ASN1_OCTET_STRING,
-	  offsetof(SecCmsRecipientKeyIdentifier,date) },
-    { SEC_ASN1_OPTIONAL | SEC_ASN1_OCTET_STRING,
+    { SEC_ASN1_INLINE | SEC_ASN1_OCTET_STRING,
+        offsetof(SecCmsRecipientKeyIdentifier,subjectKeyIdentifier),
+        SEC_ASN1_SUB(kSecAsn1OctetStringTemplate) },
+    { SEC_ASN1_INLINE | SEC_ASN1_OPTIONAL | SEC_ASN1_GENERALIZED_TIME,
+        offsetof(SecCmsRecipientKeyIdentifier,date),
+        SEC_ASN1_SUB(kSecAsn1GeneralizedTimeTemplate) },
+    { SEC_ASN1_INLINE | SEC_ASN1_OPTIONAL | SEC_ASN1_ANY,
 	  offsetof(SecCmsRecipientKeyIdentifier,other) },
     { 0 }
 };
@@ -561,7 +561,7 @@ nss_cms_get_kea_template(SecCmsKEATemplateSelector whichTemplate)
  *
  */
 static const SecAsn1Template *
-nss_cms_choose_content_template(void *src_or_dest, Boolean encoding, const char *buf, void *dest)
+nss_cms_choose_content_template(void *src_or_dest, Boolean encoding, const char *buf, size_t len, void *dest)
 {
     const SecAsn1Template *theTemplate;
     SecCmsContentInfoRef cinfo;
@@ -576,7 +576,6 @@ nss_cms_choose_content_template(void *src_or_dest, Boolean encoding, const char 
 	theTemplate = SEC_ASN1_GET(kSecAsn1PointerToAnyTemplate);
 	break;
     case SEC_OID_PKCS7_DATA:
-    case SEC_OID_OTHER:
 	theTemplate = SEC_ASN1_GET(kSecAsn1PointerToOctetStringTemplate);
 	break;
     case SEC_OID_PKCS7_SIGNED_DATA:

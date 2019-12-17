@@ -38,10 +38,13 @@
 #include "cmslocal.h"
 
 #include "secoid.h"
-#include "secitem.h"
+#include "SecAsn1Item.h"
 
 #include <security_asn1/secasn1.h>
 #include <security_asn1/secerr.h>
+#include <security_asn1/secport.h>
+
+#include <Security/SecAsn1Templates.h>
 
 /*
  * -------------------------------------------------------------------
@@ -61,10 +64,10 @@
  * with SecCmsAttributeAddValue.
  */
 SecCmsAttribute *
-SecCmsAttributeCreate(PRArenaPool *poolp, SECOidTag oidtag, CSSM_DATA_PTR value, Boolean encoded)
+SecCmsAttributeCreate(PRArenaPool *poolp, SECOidTag oidtag, SecAsn1Item * value, Boolean encoded)
 {
     SecCmsAttribute *attr;
-    CSSM_DATA_PTR copiedvalue;
+    SecAsn1Item * copiedvalue;
     void *mark;
 
     PORT_Assert (poolp != NULL);
@@ -89,7 +92,8 @@ SecCmsAttributeCreate(PRArenaPool *poolp, SECOidTag oidtag, CSSM_DATA_PTR value,
 	if (SECITEM_CopyItem(poolp, copiedvalue, value) != SECSuccess)
 	    goto loser;
 
-	SecCmsArrayAdd(poolp, (void ***)&(attr->values), (void *)copiedvalue);
+        if (SecCmsArrayAdd(poolp, (void ***)&(attr->values), (void *)copiedvalue) != SECSuccess)
+            goto loser;
     }
 
     attr->encoded = encoded;
@@ -108,21 +112,25 @@ loser:
  * SecCmsAttributeAddValue - add another value to an attribute
  */
 OSStatus
-SecCmsAttributeAddValue(PLArenaPool *poolp, SecCmsAttribute *attr, CSSM_DATA_PTR value)
+SecCmsAttributeAddValue(PLArenaPool *poolp, SecCmsAttribute *attr, SecAsn1Item * value)
 {
-    CSSM_DATA copiedvalue;
+    SecAsn1Item *copiedvalue;
     void *mark;
 
     PORT_Assert (poolp != NULL);
 
     mark = PORT_ArenaMark(poolp);
 
-    /* XXX we need an object memory model #$%#$%! */
-    if (SECITEM_CopyItem(poolp, &copiedvalue, value) != SECSuccess)
-	goto loser;
+    if (value != NULL) {
+        if ((copiedvalue = SECITEM_AllocItem(poolp, NULL, value->Length)) == NULL)
+            goto loser;
 
-    if (SecCmsArrayAdd(poolp, (void ***)&(attr->values), (void *)&copiedvalue) != SECSuccess)
-	goto loser;
+        if (SECITEM_CopyItem(poolp, copiedvalue, value) != SECSuccess)
+            goto loser;
+
+        if (SecCmsArrayAdd(poolp, (void ***)&(attr->values), (void *)copiedvalue) != SECSuccess)
+            goto loser;
+    }
 
     PORT_ArenaUnmark(poolp, mark);
     return SECSuccess;
@@ -155,10 +163,10 @@ SecCmsAttributeGetType(SecCmsAttribute *attr)
  * - Multiple values are *not* expected.
  * - Empty values are *not* expected.
  */
-CSSM_DATA_PTR
+SecAsn1Item *
 SecCmsAttributeGetValue(SecCmsAttribute *attr)
 {
-    CSSM_DATA_PTR value;
+    SecAsn1Item * value;
 
     if (attr == NULL)
 	return NULL;
@@ -178,9 +186,9 @@ SecCmsAttributeGetValue(SecCmsAttribute *attr)
  * SecCmsAttributeCompareValue - compare the attribute's first value against data
  */
 Boolean
-SecCmsAttributeCompareValue(SecCmsAttribute *attr, CSSM_DATA_PTR av)
+SecCmsAttributeCompareValue(SecCmsAttribute *attr, SecAsn1Item * av)
 {
-    CSSM_DATA_PTR value;
+    SecAsn1Item * value;
     
     if (attr == NULL)
 	return PR_FALSE;
@@ -201,7 +209,7 @@ SecCmsAttributeCompareValue(SecCmsAttribute *attr, CSSM_DATA_PTR av)
  * helper function for dynamic template determination of the attribute value
  */
 static const SecAsn1Template *
-cms_attr_choose_attr_value_template(void *src_or_dest, Boolean encoding, const char *buf, void *dest)
+cms_attr_choose_attr_value_template(void *src_or_dest, Boolean encoding, const char *buf, size_t len, void *dest)
 {
     const SecAsn1Template *theTemplate;
     SecCmsAttribute *attribute;
@@ -233,6 +241,7 @@ cms_attr_choose_attr_value_template(void *src_or_dest, Boolean encoding, const c
 	switch (oiddata->offset) {
 	case SEC_OID_PKCS9_SMIME_CAPABILITIES:
 	case SEC_OID_SMIME_ENCRYPTION_KEY_PREFERENCE:
+	case SEC_OID_APPLE_HASH_AGILITY_V2:
 	    /* these guys need to stay DER-encoded */
 	default:
 	    /* same goes for OIDs that are not handled here */
@@ -251,10 +260,12 @@ cms_attr_choose_attr_value_template(void *src_or_dest, Boolean encoding, const c
 	    theTemplate = SEC_ASN1_GET(kSecAsn1ObjectIDTemplate);
 	    break;
 	case SEC_OID_PKCS9_MESSAGE_DIGEST:
+        case SEC_OID_APPLE_HASH_AGILITY:
 	    encoded = PR_FALSE;
 	    theTemplate = SEC_ASN1_GET(kSecAsn1OctetStringTemplate);
 	    break;
 	case SEC_OID_PKCS9_SIGNING_TIME:
+	case SEC_OID_APPLE_EXPIRATION_TIME:
 	    encoded = PR_FALSE;
 	    theTemplate = SEC_ASN1_GET(kSecAsn1UTCTimeTemplate); // @@@ This should be a choice between UTCTime and GeneralizedTime -- mb
 	    break;
@@ -312,8 +323,8 @@ const SecAsn1Template nss_cms_set_of_attribute_template[] = {
  * and think long and hard about the implications of making it always
  * do the reordering.)
  */
-CSSM_DATA_PTR
-SecCmsAttributeArrayEncode(PRArenaPool *poolp, SecCmsAttribute ***attrs, CSSM_DATA_PTR dest)
+SecAsn1Item *
+SecCmsAttributeArrayEncode(PRArenaPool *poolp, SecCmsAttribute ***attrs, SecAsn1Item * dest)
 {
     return SEC_ASN1EncodeItem (poolp, dest, (void *)attrs, nss_cms_set_of_attribute_template);
 }
@@ -416,7 +427,7 @@ loser:
  * SecCmsAttributeArraySetAttr - set an attribute's value in a set of attributes
  */
 OSStatus
-SecCmsAttributeArraySetAttr(PLArenaPool *poolp, SecCmsAttribute ***attrs, SECOidTag type, CSSM_DATA_PTR value, Boolean encoded)
+SecCmsAttributeArraySetAttr(PLArenaPool *poolp, SecCmsAttribute ***attrs, SECOidTag type, SecAsn1Item * value, Boolean encoded)
 {
     SecCmsAttribute *attr;
     void *mark;

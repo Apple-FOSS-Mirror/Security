@@ -34,11 +34,13 @@
 #include "cmslocal.h"
 
 #include "cert.h"
-#include "secitem.h"
+#include "SecAsn1Item.h"
 #include "secoid.h"
 
 #include <security_asn1/secasn1.h>
 #include <security_asn1/secerr.h>
+#include <security_asn1/secport.h>
+
 #include <Security/SecIdentity.h>
 
 static int
@@ -98,7 +100,7 @@ nss_cms_recipients_traverse(SecCmsRecipientInfoRef *recipientinfos, SecCmsRecipi
 			break;
 		    case SecCmsKeyAgreeRecipientIDRKeyID:
 			rle->kind = RLSubjKeyID;
-			rle->id.subjectKeyID = rek->recipientIdentifier.id.recipientKeyIdentifier.subjectKeyIdentifier;
+			rle->id.subjectKeyID = &rek->recipientIdentifier.id.recipientKeyIdentifier.subjectKeyIdentifier;
 			break;
 		    }
 		    recipient_list[rlindex++] = rle;
@@ -130,8 +132,8 @@ nss_cms_recipient_list_create(SecCmsRecipientInfoRef *recipientinfos)
 
     /* count the number of recipient identifiers */
     count = nss_cms_recipients_traverse(recipientinfos, NULL);
-    if (count <= 0) {
-	/* no recipients? */
+    if (count <= 0 || count>=(int)((INT_MAX/sizeof(SecCmsRecipient *))-1)) {
+	/* no recipients? or risk of underallocation 20130783 */
 	PORT_SetError(SEC_ERROR_BAD_DATA);
 #if 0
 	PORT_SetErrorString("Cannot find recipient data in envelope.");
@@ -190,12 +192,12 @@ nss_cms_FindCertAndKeyByRecipientList(SecCmsRecipient **recipient_list, void *wi
     SecCertificateRef cert = NULL;
     SecPrivateKeyRef privKey = NULL;
     SecIdentityRef identity = NULL;
+    int ix;
     CFTypeRef keychainOrArray = NULL; // @@@ The caller should be able to pass this in somehow.
-    int index;
 
-    for (index = 0; recipient_list[index] != NULL; ++index)
+    for (ix = 0; recipient_list[ix] != NULL; ++ix)
     {
-	recipient = recipient_list[index];
+	recipient = recipient_list[ix];
 
 	switch (recipient->kind)
 	{
@@ -211,6 +213,9 @@ nss_cms_FindCertAndKeyByRecipientList(SecCmsRecipient **recipient_list, void *wi
 	    break;
     }
 
+    if (!identity)
+        goto loser;
+        
     if (!recipient)
 	goto loser;
 
@@ -223,7 +228,7 @@ nss_cms_FindCertAndKeyByRecipientList(SecCmsRecipient **recipient_list, void *wi
     recipient->cert = cert;
     recipient->privkey = privKey;
 
-    return index;
+    return ix;
 
 loser:
     if (identity)

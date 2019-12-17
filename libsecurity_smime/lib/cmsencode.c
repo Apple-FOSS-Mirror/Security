@@ -43,17 +43,20 @@
 #include "cmslocal.h"
 
 #include "secoid.h"
-#include "secitem.h"
+#include "SecAsn1Item.h"
 
 #include <security_asn1/secasn1.h>
 #include <security_asn1/secerr.h>
-#include <CoreServices/../Frameworks/CarbonCore.framework/Headers/MacErrors.h>
+#include <security_asn1/secport.h>
+
+#include <Security/SecBase.h>
+
+#include <limits.h>
 
 struct nss_cms_encoder_output {
     SecCmsContentCallback outputfn;
     void *outputarg;
-    PLArenaPool *destpoolp;
-    CSSM_DATA_PTR dest;
+    CFMutableDataRef berData;
 };
 
 struct SecCmsEncoderStr {
@@ -69,8 +72,8 @@ struct SecCmsEncoderStr {
 
 static OSStatus nss_cms_before_data(SecCmsEncoderRef p7ecx);
 static OSStatus nss_cms_after_data(SecCmsEncoderRef p7ecx);
-static OSStatus nss_cms_encoder_update(SecCmsEncoderRef p7ecx, const char *data, size_t len);
-static OSStatus nss_cms_encoder_work_data(SecCmsEncoderRef p7ecx, CSSM_DATA_PTR dest,
+static void nss_cms_encoder_update(void *arg, const char *data, size_t len);
+static OSStatus nss_cms_encoder_work_data(SecCmsEncoderRef p7ecx, SecAsn1Item * dest,
 			     const unsigned char *data, size_t len,
 			     Boolean final, Boolean innermost);
 
@@ -86,13 +89,11 @@ nss_cms_encoder_out(void *arg, const char *buf, size_t len,
 		      int depth, SEC_ASN1EncodingPart data_kind)
 {
     struct nss_cms_encoder_output *output = (struct nss_cms_encoder_output *)arg;
-    unsigned char *dest;
-    CSSM_SIZE offset;
 
 #ifdef CMSDEBUG
-    int i;
+    size_t i;
 
-    fprintf(stderr, "kind = %d, depth = %d, len = %lu\n", data_kind, depth, len);
+    fprintf(stderr, "kind = %d, depth = %d, len = %d\n", data_kind, depth, len);
     for (i=0; i < len; i++) {
 	fprintf(stderr, " %02x%s", (unsigned int)buf[i] & 0xff, ((i % 16) == 15) ? "\n" : "");
     }
@@ -104,26 +105,9 @@ nss_cms_encoder_out(void *arg, const char *buf, size_t len,
 	/* call output callback with DER data */
 	output->outputfn(output->outputarg, buf, len);
 
-    if (output->dest != NULL) {
-	/* store DER data in CSSM_DATA */
-	offset = output->dest->Length;
-	if (offset == 0) {
-	    dest = (unsigned char *)PORT_ArenaAlloc(output->destpoolp, len);
-	} else {
-	    dest = (unsigned char *)PORT_ArenaGrow(output->destpoolp, 
-				  output->dest->Data,
-				  output->dest->Length,
-				  output->dest->Length + len);
-	}
-	if (dest == NULL)
-	    /* oops */
-	    return;
-
-	output->dest->Data = dest;
-	output->dest->Length += len;
-
-	/* copy it in */
-	PORT_Memcpy(output->dest->Data + offset, buf, len);
+    if (output->berData != NULL) {
+	/* store DER data in output->dest */
+	CFDataAppendBytes(output->berData, (const UInt8 *)buf, len);
     }
 }
 
@@ -140,18 +124,16 @@ nss_cms_encoder_notify(void *arg, Boolean before, void *dest, int depth)
     SecCmsEncoderRef p7ecx;
     SecCmsContentInfoRef rootcinfo, cinfo;
     Boolean after = !before;
-    PLArenaPool *poolp;
     SECOidTag childtype;
-    CSSM_DATA_PTR item;
+    SecAsn1Item * item;
 
     p7ecx = (SecCmsEncoderRef)arg;
     PORT_Assert(p7ecx != NULL);
 
     rootcinfo = &(p7ecx->cmsg->contentInfo);
-    poolp = p7ecx->cmsg->poolp;
 
 #ifdef CMSDEBUG
-    fprintf(stderr, "%6.6s, dest = %p, depth = %d\n", before ? "before" : "after", dest, depth);
+    fprintf(stderr, "%6.6s, dest = 0x%08x, depth = %d\n", before ? "before" : "after", dest, depth);
 #endif
 
     /*
@@ -171,7 +153,6 @@ nss_cms_encoder_notify(void *arg, Boolean before, void *dest, int depth)
 	break;
 
     case SEC_OID_PKCS7_DATA:
-    case SEC_OID_OTHER:
 	if (before && dest == &(rootcinfo->rawContent)) {
 	    /* just set up encoder to grab from user - no encryption or digesting */
 	    if ((item = rootcinfo->content.data) != NULL)
@@ -195,12 +176,13 @@ nss_cms_encoder_notify(void *arg, Boolean before, void *dest, int depth)
 	    /* we're right before encoding the data (if we have some or not) */
 	    /* (for encrypted data, we're right before the contentEncAlg which may change */
 	    /*  in nss_cms_before_data because of IV calculation when setting up encryption) */
-	    if (nss_cms_before_data(p7ecx) != SECSuccess)
+            if (nss_cms_before_data(p7ecx) != SECSuccess) {
 		p7ecx->error = PORT_GetError();
+                PORT_SetError(0); // Clean the thread error since we've returned the error
+            }
 	}
 	if (before && dest == &(cinfo->rawContent)) {
-	    if ( ((childtype == SEC_OID_PKCS7_DATA) || (childtype == SEC_OID_OTHER)) &&
-		 ((item = cinfo->content.data) != NULL))
+	    if (childtype == SEC_OID_PKCS7_DATA && (item = cinfo->content.data) != NULL)
 		/* we have data - feed it in */
 		(void)nss_cms_encoder_work_data(p7ecx, NULL, item->Data, item->Length, PR_TRUE, PR_TRUE);
 	    else
@@ -208,8 +190,10 @@ nss_cms_encoder_notify(void *arg, Boolean before, void *dest, int depth)
 		SEC_ASN1EncoderSetTakeFromBuf(p7ecx->ecx);
 	}
 	if (after && dest == &(cinfo->rawContent)) {
-	    if (nss_cms_after_data(p7ecx) != SECSuccess)
+            if (nss_cms_after_data(p7ecx) != SECSuccess) {
 		p7ecx->error = PORT_GetError();
+                PORT_SetError(0); // Clean the thread error since we've returned the error
+            }
 	    SEC_ASN1EncoderClearNotifyProc(p7ecx->ecx);	/* no need to get notified anymore */
 	}
 	break;
@@ -225,11 +209,8 @@ nss_cms_before_data(SecCmsEncoderRef p7ecx)
     OSStatus rv;
     SECOidTag childtype;
     SecCmsContentInfoRef cinfo;
-    PLArenaPool *poolp;
     SecCmsEncoderRef childp7ecx;
     const SecAsn1Template *template;
-
-    poolp = p7ecx->cmsg->poolp;
 
     /* call _Encode_BeforeData handlers */
     switch (p7ecx->type) {
@@ -280,10 +261,9 @@ nss_cms_before_data(SecCmsEncoderRef p7ecx)
 	childp7ecx->type = childtype;
 	childp7ecx->content = cinfo->content;
 	/* use the non-recursive update function here, of course */
-	childp7ecx->output.outputfn = (SecCmsContentCallback)nss_cms_encoder_update;
+	childp7ecx->output.outputfn = nss_cms_encoder_update;
 	childp7ecx->output.outputarg = p7ecx;
-	childp7ecx->output.destpoolp = NULL;
-	childp7ecx->output.dest = NULL;
+	childp7ecx->output.berData = NULL;
 	childp7ecx->cmsg = p7ecx->cmsg;
 
 	template = SecCmsUtilGetTemplateByTypeTag(childtype);
@@ -305,7 +285,6 @@ nss_cms_before_data(SecCmsEncoderRef p7ecx)
 	    rv = SecCmsEncryptedDataEncodeBeforeStart(cinfo->content.encryptedData);
 	    break;
 	case SEC_OID_PKCS7_DATA:
-	case SEC_OID_OTHER:
 	    rv = SECSuccess;
 	    break;
 	default:
@@ -351,7 +330,6 @@ nss_cms_before_data(SecCmsEncoderRef p7ecx)
 	break;
 
     case SEC_OID_PKCS7_DATA:
-    case SEC_OID_OTHER:
 	p7ecx->childp7ecx = NULL;
 	break;
     default:
@@ -391,7 +369,6 @@ nss_cms_after_data(SecCmsEncoderRef p7ecx)
 	rv = SecCmsEncryptedDataEncodeAfterData(p7ecx->content.encryptedData);
 	break;
     case SEC_OID_PKCS7_DATA:
-    case SEC_OID_OTHER:
 	/* do nothing */
 	break;
     default:
@@ -406,9 +383,10 @@ nss_cms_after_data(SecCmsEncoderRef p7ecx)
  *
  * (from the user or the next encoding layer)
  * Here, we need to digest and/or encrypt, then pass it on
+ *
  */
 static OSStatus
-nss_cms_encoder_work_data(SecCmsEncoderRef p7ecx, CSSM_DATA_PTR dest,
+nss_cms_encoder_work_data(SecCmsEncoderRef p7ecx, SecAsn1Item * dest,
 			     const unsigned char *data, size_t len,
 			     Boolean final, Boolean innermost)
 {
@@ -426,6 +404,7 @@ nss_cms_encoder_work_data(SecCmsEncoderRef p7ecx, CSSM_DATA_PTR dest,
      * modifications/development, that is why it is here.)
      */
     PORT_Assert ((data != NULL && len) || final);
+    PORT_Assert (len < UINT_MAX); /* overflow check for later cast */
 
     /* we got data (either from the caller, or from a lower level encoder) */
     cinfo = SecCmsContentGetContentInfo(p7ecx->content.pointer, p7ecx->type);
@@ -436,11 +415,15 @@ nss_cms_encoder_work_data(SecCmsEncoderRef p7ecx, CSSM_DATA_PTR dest,
 
     /* Encrypt this chunk. */
     if (cinfo->ciphcx != NULL) {
-	CSSM_SIZE inlen;	/* length of data being encrypted */
-	CSSM_SIZE outlen;	/* length of encrypted data */
-	CSSM_SIZE buflen;	/* length available for encrypted data */
+	unsigned int inlen;	/* length of data being encrypted */
+	unsigned int outlen = 0;	/* length of encrypted data */
+	unsigned int buflen;	/* length available for encrypted data */
 
-	inlen = len;
+        /* 64 bits cast: only an issue if unsigned int is smaller than size_t.
+           Worst case is you will truncate a CMS blob bigger than 4GB when
+           encrypting */
+	inlen = (unsigned int)len;
+
 	buflen = SecCmsCipherContextEncryptLength(cinfo->ciphcx, inlen, final);
 	if (buflen == 0) {
 	    /*
@@ -501,11 +484,13 @@ done:
  *
  * no recursion here because we REALLY want to end up at the next higher encoder!
  */
-static OSStatus
-nss_cms_encoder_update(SecCmsEncoderRef p7ecx, const char *data, size_t len)
+static void
+nss_cms_encoder_update(void *arg, const char *data, size_t len)
 {
     /* XXX Error handling needs help.  Return what?  Do "Finish" on failure? */
-    return nss_cms_encoder_work_data (p7ecx, NULL, (const unsigned char *)data, len, PR_FALSE, PR_FALSE);
+    SecCmsEncoderRef p7ecx = (SecCmsEncoderRef)arg;
+
+    (void)nss_cms_encoder_work_data (p7ecx, NULL, (const unsigned char *)data, len, PR_FALSE, PR_FALSE);
 }
 
 /*
@@ -514,7 +499,7 @@ nss_cms_encoder_update(SecCmsEncoderRef p7ecx, const char *data, size_t len)
  * "cmsg" - message to encode
  * "outputfn", "outputarg" - callback function for delivery of DER-encoded output
  *                           will not be called if NULL.
- * "dest" - if non-NULL, pointer to CSSM_DATA that will hold the DER-encoded output
+ * "dest" - if non-NULL, pointer to SecAsn1Item that will hold the DER-encoded output
  * "destpoolp" - pool to allocate DER-encoded output in
  * "pwfn", pwfn_arg" - callback function for getting token password
  * "decrypt_key_cb", "decrypt_key_cb_arg" - callback function for getting bulk key for encryptedData
@@ -523,30 +508,31 @@ nss_cms_encoder_update(SecCmsEncoderRef p7ecx, const char *data, size_t len)
 OSStatus
 SecCmsEncoderCreate(SecCmsMessageRef cmsg,
                     SecCmsContentCallback outputfn, void *outputarg,
-                    CSSM_DATA_PTR dest, SecArenaPoolRef destpool,
+                    CFMutableDataRef outBer,
                     PK11PasswordFunc pwfn, void *pwfn_arg,
                     SecCmsGetDecryptKeyCallback decrypt_key_cb, void *decrypt_key_cb_arg,
-                    SECAlgorithmID **detached_digestalgs, CSSM_DATA_PTR *detached_digests,
                     SecCmsEncoderRef *outEncoder)
 {
     SecCmsEncoderRef p7ecx;
     OSStatus result;
     SecCmsContentInfoRef cinfo;
 
-    SecCmsMessageSetEncodingParams(cmsg, pwfn, pwfn_arg, decrypt_key_cb, decrypt_key_cb_arg,
-					detached_digestalgs, detached_digests);
+    /* Clear the thread error to clean up dirty threads */
+    PORT_SetError(0);
+
+    SecCmsMessageSetEncodingParams(cmsg, pwfn, pwfn_arg, decrypt_key_cb, decrypt_key_cb_arg);
 
     p7ecx = (SecCmsEncoderRef)PORT_ZAlloc(sizeof(struct SecCmsEncoderStr));
     if (p7ecx == NULL) {
-        result = memFullErr;
+        result = errSecAllocate;
         goto loser;
     }
 
     p7ecx->cmsg = cmsg;
     p7ecx->output.outputfn = outputfn;
     p7ecx->output.outputarg = outputarg;
-    p7ecx->output.dest = dest;
-    p7ecx->output.destpoolp = (PLArenaPool *)destpool;
+    p7ecx->output.berData = outBer;
+
     p7ecx->type = SEC_OID_UNKNOWN;
 
     cinfo = SecCmsMessageGetContentInfo(cmsg);
@@ -566,11 +552,14 @@ SecCmsEncoderCreate(SecCmsMessageRef cmsg,
 	break;
     default:
         /* @@@ We need a better error for unsupported message types. */
-	result = paramErr;
+	result = errSecParam;
 	break;
     }
-    if (result)
+
+    if (result) {
+        PORT_Free(p7ecx);
         goto loser;
+    }
 
     /* Initialize the BER encoder.
      * Note that this will not encode anything until the first call to SEC_ASN1EncoderUpdate */
@@ -578,7 +567,8 @@ SecCmsEncoderCreate(SecCmsMessageRef cmsg,
                                       nss_cms_encoder_out, &(p7ecx->output));
     if (p7ecx->ecx == NULL) {
         result = PORT_GetError();
-	PORT_Free (p7ecx);
+	PORT_Free(p7ecx);
+        PORT_SetError(0); // Clean the thread error since we've returned the error
         goto loser;
     }
     p7ecx->ecxupdated = PR_FALSE;
@@ -599,7 +589,8 @@ SecCmsEncoderCreate(SecCmsMessageRef cmsg,
      * a child encoder). */
     if (SEC_ASN1EncoderUpdate(p7ecx->ecx, NULL, 0) != SECSuccess) {
         result = PORT_GetError();
-	PORT_Free (p7ecx);
+	PORT_Free(p7ecx);
+        PORT_SetError(0); // Clean the thread error since we've returned the error
         goto loser;
     }
 
@@ -625,6 +616,10 @@ SecCmsEncoderUpdate(SecCmsEncoderRef p7ecx, const void *data, CFIndex len)
     SecCmsContentInfoRef cinfo;
     SECOidTag childtype;
 
+    if (!p7ecx) {
+        return errSecParam;
+    }
+
     if (p7ecx->error)
 	return p7ecx->error;
 
@@ -637,16 +632,18 @@ SecCmsEncoderUpdate(SecCmsEncoderRef p7ecx, const void *data, CFIndex len)
 	/* find out about our inner content type - must be data */
 	cinfo = SecCmsContentGetContentInfo(p7ecx->content.pointer, p7ecx->type);
 	childtype = SecCmsContentInfoGetContentTypeTag(cinfo);
-	if ((childtype != SEC_OID_PKCS7_DATA) && (childtype != SEC_OID_OTHER))
-	    return paramErr; /* @@@ Maybe come up with a better error? */
+	if (childtype != SEC_OID_PKCS7_DATA)
+	    return errSecParam; /* @@@ Maybe come up with a better error? */
 	/* and we must not have preset data */
 	if (cinfo->content.data != NULL)
-	    return paramErr; /* @@@ Maybe come up with a better error? */
+	    return errSecParam; /* @@@ Maybe come up with a better error? */
 
 	/*  hand it the data so it can encode it (let DER trickle up the chain) */
 	result = nss_cms_encoder_work_data(p7ecx, NULL, (const unsigned char *)data, len, PR_FALSE, PR_TRUE);
-        if (result)
+        if (result) {
             result = PORT_GetError();
+            PORT_SetError(0); // Clean the thread error since we've returned the error
+        }
     }
     return result;
 }
@@ -735,8 +732,7 @@ SecCmsEncoderFinish(SecCmsEncoderRef p7ecx)
     /* find out about our inner content type - must be data */
     cinfo = SecCmsContentGetContentInfo(p7ecx->content.pointer, p7ecx->type);
     childtype = SecCmsContentInfoGetContentTypeTag(cinfo);
-    if ( ((childtype == SEC_OID_PKCS7_DATA) || (childtype == SEC_OID_OTHER)) && 
-	 (cinfo->content.data == NULL)) {
+    if (childtype == SEC_OID_PKCS7_DATA && cinfo->content.data == NULL) {
 	SEC_ASN1EncoderClearTakeFromBuf(p7ecx->ecx);
 	/* now that TakeFromBuf is off, this will kick this encoder to finish encoding */
 	result = SEC_ASN1EncoderUpdate(p7ecx->ecx, NULL, 0);
@@ -752,22 +748,23 @@ SecCmsEncoderFinish(SecCmsEncoderRef p7ecx)
 loser:
     SEC_ASN1EncoderFinish(p7ecx->ecx);
     PORT_Free (p7ecx);
+    PORT_SetError(0); // Clean the thread error since we've returned the error
     return result;
 }
 
 OSStatus
-SecCmsMessageEncode(SecCmsMessageRef cmsg, const CSSM_DATA *input, SecArenaPoolRef arena,
-                    CSSM_DATA_PTR outBer)
+SecCmsMessageEncode(SecCmsMessageRef cmsg, const SecAsn1Item *input,
+                    CFMutableDataRef outBer)
 {
-    SecCmsEncoderRef encoder;
+    SecCmsEncoderRef encoder = NULL;
     OSStatus result;
 
-    if (!cmsg || !outBer || !arena) {
-        result = paramErr;
+    if (!cmsg || !outBer) {
+        result = errSecParam;
         goto loser;
     }
 
-    result = SecCmsEncoderCreate(cmsg, 0, 0, outBer, arena, 0, 0, 0, 0, 0, 0, &encoder);
+    result = SecCmsEncoderCreate(cmsg, 0, 0, outBer, 0, 0, 0, 0, &encoder);
     if (result)
 	goto loser;
 

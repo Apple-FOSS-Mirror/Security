@@ -38,7 +38,7 @@
 #include "cmslocal.h"
 
 #include "secoid.h"
-#include "secitem.h"
+#include "SecAsn1Item.h"
 #include "cert.h"
 #include "SecSMIMEPriv.h"
 
@@ -46,6 +46,7 @@
 #include <security_asn1/secerr.h>
 #include <Security/SecSMIME.h>
 #include <Security/SecKeyPriv.h>
+#include <Security/SecCertificatePriv.h>
 
 SEC_ASN1_MKSUB(CERT_IssuerAndSNTemplate)
 SEC_ASN1_MKSUB(SEC_OctetStringTemplate)
@@ -57,18 +58,18 @@ static unsigned char asn1_int64[] = { SEC_ASN1_INTEGER, 0x01, 0x40 };
 static unsigned char asn1_int128[] = { SEC_ASN1_INTEGER, 0x02, 0x00, 0x80 };
 
 /* RC2 algorithm parameters (used in smime_cipher_map) */
-static CSSM_DATA param_int40 = { sizeof(asn1_int40), asn1_int40 };
-static CSSM_DATA param_int64 = { sizeof(asn1_int64), asn1_int64 };
-static CSSM_DATA param_int128 = { sizeof(asn1_int128), asn1_int128 };
+static SecAsn1Item param_int40 = { sizeof(asn1_int40), asn1_int40 };
+static SecAsn1Item param_int64 = { sizeof(asn1_int64), asn1_int64 };
+static SecAsn1Item param_int128 = { sizeof(asn1_int128), asn1_int128 };
 
 /*
- * XXX Would like the "parameters" field to be a CSSM_DATA_PTR , but the
+ * XXX Would like the "parameters" field to be a SecAsn1Item * , but the
  * encoder is having trouble with optional pointers to an ANY.  Maybe
  * once that is fixed, can change this back...
  */
 typedef struct {
-    CSSM_DATA capabilityID;
-    CSSM_DATA parameters;
+    SecAsn1Item capabilityID;
+    SecAsn1Item parameters;
     long cipher;		/* optimization */
 } NSSSMIMECapability;
 
@@ -101,7 +102,7 @@ typedef struct {
     union {
 	SecCmsIssuerAndSN		*issuerAndSN;
 	SecCmsRecipientKeyIdentifier	*recipientKeyID;
-	CSSM_DATA_PTR subjectKeyID;
+	SecAsn1Item *subjectKeyID;
     } id;
 } NSSSMIMEEncryptionKeyPreference;
 
@@ -117,8 +118,8 @@ static const SecAsn1Template smime_encryptionkeypref_template[] = {
 	  NSSSMIMEEncryptionKeyPref_IssuerSN },
     { SEC_ASN1_POINTER | SEC_ASN1_CONTEXT_SPECIFIC | 1,
 	  offsetof(NSSSMIMEEncryptionKeyPreference,id.recipientKeyID),
-	  SecCmsRecipientKeyIdentifierTemplate,
-	  NSSSMIMEEncryptionKeyPref_IssuerSN },
+	  SEC_ASN1_SUB(SecCmsRecipientKeyIdentifierTemplate),
+	  NSSSMIMEEncryptionKeyPref_RKeyID },
     { SEC_ASN1_POINTER | SEC_ASN1_CONTEXT_SPECIFIC | SEC_ASN1_XTRN | 2,
 	  offsetof(NSSSMIMEEncryptionKeyPreference,id.subjectKeyID),
 	  SEC_ASN1_SUB(kSecAsn1OctetStringTemplate),
@@ -130,7 +131,7 @@ static const SecAsn1Template smime_encryptionkeypref_template[] = {
 typedef struct {
     unsigned long cipher;
     SECOidTag algtag;
-    CSSM_DATA_PTR parms;
+    SecAsn1Item *parms;
     Boolean enabled;	/* in the user's preferences */
     Boolean allowed;	/* per export policy */
 } smime_cipher_map_entry;
@@ -139,12 +140,14 @@ typedef struct {
 static smime_cipher_map_entry smime_cipher_map[] = {
 /*    cipher			algtag			parms		enabled  allowed */
 /*    ---------------------------------------------------------------------------------- */
-    { SMIME_RC2_CBC_40,		SEC_OID_RC2_CBC,	&param_int40,	PR_TRUE, PR_TRUE },
-    { SMIME_DES_CBC_56,		SEC_OID_DES_CBC,	NULL,		PR_TRUE, PR_TRUE },
-    { SMIME_RC2_CBC_64,		SEC_OID_RC2_CBC,	&param_int64,	PR_TRUE, PR_TRUE },
-    { SMIME_RC2_CBC_128,	SEC_OID_RC2_CBC,	&param_int128,	PR_TRUE, PR_TRUE },
+    { SMIME_RC2_CBC_40,		SEC_OID_RC2_CBC,	&param_int40,	PR_FALSE, PR_FALSE },
+    { SMIME_DES_CBC_56,		SEC_OID_DES_CBC,	NULL,			PR_TRUE, PR_FALSE },
+    { SMIME_RC2_CBC_64,		SEC_OID_RC2_CBC,	&param_int64,	PR_FALSE, PR_FALSE },
+    { SMIME_RC2_CBC_128,	SEC_OID_RC2_CBC,	&param_int128,	PR_FALSE, PR_FALSE },
     { SMIME_DES_EDE3_168,	SEC_OID_DES_EDE3_CBC,	NULL,		PR_TRUE, PR_TRUE },
-    { SMIME_AES_CBC_128,        SEC_OID_AES_128_CBC,    NULL,           PR_TRUE, PR_TRUE },
+    { SMIME_AES_CBC_128,	SEC_OID_AES_128_CBC,	NULL,		PR_TRUE, PR_TRUE },
+    { SMIME_AES_CBC_192,	SEC_OID_AES_192_CBC,	NULL,		PR_TRUE, PR_TRUE },
+    { SMIME_AES_CBC_256,	SEC_OID_AES_256_CBC,	NULL,		PR_TRUE, PR_TRUE },
     { SMIME_FORTEZZA,		SEC_OID_FORTEZZA_SKIPJACK, NULL,	PR_TRUE, PR_TRUE }
 };
 static const int smime_cipher_map_count = sizeof(smime_cipher_map) / sizeof(smime_cipher_map_entry);
@@ -168,7 +171,7 @@ smime_mapi_by_cipher(unsigned long cipher)
  * NSS_SMIME_EnableCipher - this function locally records the user's preference
  */
 OSStatus 
-SecSMIMEEnableCipher(uint32 which, Boolean on)
+SecSMIMEEnableCipher(unsigned long which, Boolean on)
 {
     unsigned long mask;
     int mapi;
@@ -191,8 +194,7 @@ SecSMIMEEnableCipher(uint32 which, Boolean on)
 	return SECFailure;
     }
 
-    if (smime_cipher_map[mapi].enabled != on)
-	smime_cipher_map[mapi].enabled = on;
+    smime_cipher_map[mapi].enabled = on;
 
     return SECSuccess;
 }
@@ -202,7 +204,7 @@ SecSMIMEEnableCipher(uint32 which, Boolean on)
  * this function locally records the export policy
  */
 OSStatus 
-SecSMIMEAllowCipher(uint32 which, Boolean on)
+SecSMIMEAllowCipher(unsigned long which, Boolean on)
 {
     unsigned long mask;
     int mapi;
@@ -219,8 +221,7 @@ SecSMIMEAllowCipher(uint32 which, Boolean on)
 	/* XXX set an error */
 	return SECFailure;
 
-    if (smime_cipher_map[mapi].allowed != on)
-	smime_cipher_map[mapi].allowed = on;
+    smime_cipher_map[mapi].allowed = on;
 
     return SECSuccess;
 }
@@ -235,14 +236,18 @@ static OSStatus
 nss_smime_get_cipher_for_alg_and_key(SECAlgorithmID *algid, SecSymmetricKeyRef key, unsigned long *cipher)
 {
     SECOidTag algtag;
-    unsigned int keylen_bits;
+    CFIndex keylen_bits;
     unsigned long c;
 
     algtag = SECOID_GetAlgorithmTag(algid);
     switch (algtag) {
     case SEC_OID_RC2_CBC:
+#if USE_CDSA_CRYPTO
 	if (SecKeyGetStrengthInBits(key, algid, &keylen_bits))
 	    return SECFailure;
+#else
+	keylen_bits = CFDataGetLength((CFDataRef)key) * 8;
+#endif
 	switch (keylen_bits) {
 	case 40:
 	    c = SMIME_RC2_CBC_40;
@@ -260,14 +265,20 @@ nss_smime_get_cipher_for_alg_and_key(SECAlgorithmID *algid, SecSymmetricKeyRef k
     case SEC_OID_DES_CBC:
 	c = SMIME_DES_CBC_56;
 	break;
+    case SEC_OID_FORTEZZA_SKIPJACK:
+	c = SMIME_FORTEZZA;
+	break;
     case SEC_OID_DES_EDE3_CBC:
 	c = SMIME_DES_EDE3_168;
 	break;
     case SEC_OID_AES_128_CBC:
 	c = SMIME_AES_CBC_128;
 	break;
-    case SEC_OID_FORTEZZA_SKIPJACK:
-	c = SMIME_FORTEZZA;
+    case SEC_OID_AES_192_CBC:
+	c = SMIME_AES_CBC_192;
+	break;
+    case SEC_OID_AES_256_CBC:
+	c = SMIME_AES_CBC_256;
 	break;
     default:
 	return SECFailure;
@@ -330,7 +341,7 @@ SecSMIMEEncryptionPossible(void)
 }
 
 
-static int
+static unsigned long
 nss_SMIME_FindCipherForSMIMECap(NSSSMIMECapability *cap)
 {
     int i;
@@ -366,6 +377,8 @@ nss_SMIME_FindCipherForSMIMECap(NSSSMIMECapability *cap)
 	return smime_cipher_map[i].cipher;	/* match found, point to cipher */
 }
 
+static int smime_keysize_by_cipher (unsigned long which);
+
 /*
  * smime_choose_cipher - choose a cipher that works for all the recipients
  *
@@ -390,7 +403,7 @@ smime_choose_cipher(SecCertificateRef scert, SecCertificateRef *rcerts)
     Boolean scert_is_fortezza = (scert == NULL) ? PR_FALSE : PK11_FortezzaHasKEA(scert);
 #endif
 
-    chosen_cipher = SMIME_RC2_CBC_40;		/* the default, LCD */
+    chosen_cipher = SMIME_DES_CBC_56;		/* the default, LCD */
     weak_mapi = smime_mapi_by_cipher(chosen_cipher);
 
     poolp = PORT_NewArena (1024);		/* XXX what is right value? */
@@ -413,7 +426,7 @@ smime_choose_cipher(SecCertificateRef scert, SecCertificateRef *rcerts)
 
     /* walk all the recipient's certs */
     for (rcount = 0; rcerts[rcount] != NULL; rcount++) {
-	CSSM_DATA_PTR profile;
+	SecAsn1Item *profile;
 	NSSSMIMECapability **caps;
 	int pref;
 
@@ -448,7 +461,7 @@ smime_choose_cipher(SecCertificateRef scert, SecCertificateRef *rcerts)
 	    /* no profile found - so we can only assume that the user can do
 	     * the mandatory algorithms which is RC2-40 (weak crypto) and 3DES (strong crypto) */
 	    SecPublicKeyRef key;
-	    unsigned int pklen_bits;
+	    size_t pklen_bits;
 
 	    /*
 	     * if recipient's public key length is > 512, vote for a strong cipher
@@ -464,7 +477,11 @@ smime_choose_cipher(SecCertificateRef scert, SecCertificateRef *rcerts)
 	    key = CERT_ExtractPublicKey(rcerts[rcount]);
 	    pklen_bits = 0;
 	    if (key != NULL) {
+#if USE_CDSA_CRYPTO
 		SecKeyGetStrengthInBits(key, NULL, &pklen_bits);
+#else
+                pklen_bits = SecKeyGetSize(key, kSecKeyKeySizeInBits);
+#endif
 		SECKEY_DestroyPublicKey (key);
 	    }
 
@@ -509,6 +526,10 @@ done:
     if (poolp != NULL)
 	PORT_FreeArena (poolp, PR_FALSE);
 
+    if (smime_keysize_by_cipher(chosen_cipher) < 128) {
+        /* you're going to use strong(er) crypto whether you like it or not */
+        chosen_cipher = SMIME_DES_EDE3_168;
+    }
     return chosen_cipher;
 }
 
@@ -530,7 +551,6 @@ smime_keysize_by_cipher (unsigned long which)
 	keysize = 64;
 	break;
       case SMIME_RC2_CBC_128:
-      case SMIME_AES_CBC_128:
 	keysize = 128;
 	break;
       case SMIME_DES_CBC_56:
@@ -568,6 +588,9 @@ SecSMIMEFindBulkAlgForRecipients(SecCertificateRef *rcerts, SECOidTag *bulkalgta
 
     cipher = smime_choose_cipher(NULL, rcerts);
     mapi = smime_mapi_by_cipher(cipher);
+    if (mapi < 0) {
+        return SECFailure;
+    }
 
     *bulkalgtag = smime_cipher_map[mapi].algtag;
     *keysize = smime_keysize_by_cipher(smime_cipher_map[mapi].cipher);
@@ -585,18 +608,17 @@ SecSMIMEFindBulkAlgForRecipients(SecCertificateRef *rcerts, SECOidTag *bulkalgta
  * symmetric ciphers, NO signature algorithms or key encipherment algorithms.
  *
  * "poolp" - arena pool to create the S/MIME capabilities data on
- * "dest" - CSSM_DATA to put the data in
+ * "dest" - SecAsn1Item to put the data in
  * "includeFortezzaCiphers" - PR_TRUE if fortezza ciphers should be included
  */
 OSStatus
-SecSMIMECreateSMIMECapabilities(SecArenaPoolRef pool, CSSM_DATA_PTR dest, Boolean includeFortezzaCiphers)
+SecSMIMECreateSMIMECapabilities(PLArenaPool *poolp, SecAsn1Item *dest, Boolean includeFortezzaCiphers)
 {
-    PLArenaPool *poolp = (PLArenaPool *)pool;
     NSSSMIMECapability *cap;
     NSSSMIMECapability **smime_capabilities;
     smime_cipher_map_entry *map;
     SECOidData *oiddata;
-    CSSM_DATA_PTR dummy;
+    SecAsn1Item *dummy;
     int i, capIndex;
 
     /* if we have an old NSSSMIMECapability array, we'll reuse it (has the right size) */
@@ -660,16 +682,15 @@ SecSMIMECreateSMIMECapabilities(SecArenaPoolRef pool, CSSM_DATA_PTR dest, Boolea
  * SecSMIMECreateSMIMEEncKeyPrefs - create S/MIME encryption key preferences attr value
  *
  * "poolp" - arena pool to create the attr value on
- * "dest" - CSSM_DATA to put the data in
+ * "dest" - SecAsn1Item to put the data in
  * "cert" - certificate that should be marked as preferred encryption key
  *          cert is expected to have been verified for EmailRecipient usage.
  */
 OSStatus
-SecSMIMECreateSMIMEEncKeyPrefs(SecArenaPoolRef pool, CSSM_DATA_PTR dest, SecCertificateRef cert)
+SecSMIMECreateSMIMEEncKeyPrefs(PLArenaPool *poolp, SecAsn1Item *dest, SecCertificateRef cert)
 {
-    PLArenaPool *poolp = (PLArenaPool *)pool;
     NSSSMIMEEncryptionKeyPreference ekp;
-    CSSM_DATA_PTR dummy = NULL;
+    SecAsn1Item *dummy = NULL;
     PLArenaPool *tmppoolp = NULL;
 
     if (cert == NULL)
@@ -697,15 +718,14 @@ loser:
  * SecSMIMECreateSMIMEEncKeyPrefs - create S/MIME encryption key preferences attr value using MS oid
  *
  * "poolp" - arena pool to create the attr value on
- * "dest" - CSSM_DATA to put the data in
+ * "dest" - SecAsn1Item to put the data in
  * "cert" - certificate that should be marked as preferred encryption key
  *          cert is expected to have been verified for EmailRecipient usage.
  */
 OSStatus
-SecSMIMECreateMSSMIMEEncKeyPrefs(SecArenaPoolRef pool, CSSM_DATA_PTR dest, SecCertificateRef cert)
+SecSMIMECreateMSSMIMEEncKeyPrefs(PLArenaPool *poolp, SecAsn1Item *dest, SecCertificateRef cert)
 {
-    PLArenaPool *poolp = (PLArenaPool *)pool;
-    CSSM_DATA_PTR dummy = NULL;
+    SecAsn1Item *dummy = NULL;
     PLArenaPool *tmppoolp = NULL;
     SecCmsIssuerAndSN *isn;
 
@@ -728,6 +748,30 @@ loser:
     return (dummy == NULL) ? SECFailure : SECSuccess;
 }
 
+static CFArrayRef CF_RETURNS_RETAINED copyCertsFromRawCerts(SecAsn1Item **rawCerts) {
+    CFMutableArrayRef certs = NULL;
+    SecCertificateRef certificate = NULL;
+    int numRawCerts = SecCmsArrayCount((void **)rawCerts);
+    int dex;
+
+    certs = CFArrayCreateMutable(NULL, numRawCerts, &kCFTypeArrayCallBacks);
+
+    for(dex=0; dex<numRawCerts; dex++) {
+        certificate = SecCertificateCreateWithBytes(NULL, rawCerts[dex]->Data, rawCerts[dex]->Length);
+        if (certificate) {
+            CFArrayAppendValue(certs, certificate);
+            CFRelease(certificate);
+        }
+        certificate = NULL;
+    }
+
+    if (CFArrayGetCount(certs) == 0) {
+        CFRelease(certs);
+        return NULL;
+    }
+    return certs;
+}
+
 /*
  * SecSMIMEGetCertFromEncryptionKeyPreference -
  *				find cert marked by EncryptionKeyPreference attribute
@@ -739,11 +783,12 @@ loser:
  * they are assumed to have been imported already.
  */
 SecCertificateRef
-SecSMIMEGetCertFromEncryptionKeyPreference(SecKeychainRef keychainOrArray, CSSM_DATA_PTR DERekp)
+SecSMIMEGetCertFromEncryptionKeyPreference(SecAsn1Item **rawCerts, SecAsn1Item *DERekp)
 {
     PLArenaPool *tmppoolp = NULL;
     SecCertificateRef cert = NULL;
     NSSSMIMEEncryptionKeyPreference ekp;
+    CFArrayRef certs = NULL;
 
     tmppoolp = PORT_NewArena(1024);
     if (tmppoolp == NULL)
@@ -753,28 +798,31 @@ SecSMIMEGetCertFromEncryptionKeyPreference(SecKeychainRef keychainOrArray, CSSM_
     if (SEC_ASN1DecodeItem(tmppoolp, &ekp, smime_encryptionkeypref_template, DERekp) != SECSuccess)
 	goto loser;
 
+    certs = copyCertsFromRawCerts(rawCerts);
+
     /* find cert */
     switch (ekp.selector) {
     case NSSSMIMEEncryptionKeyPref_IssuerSN:
-	cert = CERT_FindCertByIssuerAndSN(keychainOrArray, NULL, NULL, ekp.id.issuerAndSN);
+	cert = CERT_FindCertificateByIssuerAndSN(certs, ekp.id.issuerAndSN);
 	break;
     case NSSSMIMEEncryptionKeyPref_RKeyID:
+        cert = CERT_FindCertificateBySubjectKeyID(certs, &ekp.id.recipientKeyID->subjectKeyIdentifier);
+        break;
     case NSSSMIMEEncryptionKeyPref_SubjectKeyID:
-	/* XXX not supported yet - we need to be able to look up certs by SubjectKeyID */
+        cert = CERT_FindCertificateBySubjectKeyID(certs, ekp.id.subjectKeyID);
 	break;
     default:
 	PORT_Assert(0);
     }
 loser:
     if (tmppoolp) PORT_FreeArena(tmppoolp, PR_FALSE);
-
+    if (certs) CFRelease(certs);
     return cert;
 }
 
 #if 0
 extern const char __nss_smime_rcsid[];
 extern const char __nss_smime_sccsid[];
-#endif
 
 Boolean
 NSSSMIME_VersionCheck(const char *importedVersion)
@@ -798,4 +846,5 @@ NSSSMIME_VersionCheck(const char *importedVersion)
     return NSS_VersionCheck(importedVersion);
 #endif
 }
+#endif /* 0 */
 

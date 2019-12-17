@@ -1,0 +1,19 @@
+
+SDKROOT = macosx.internal
+
+ARCHS[sdk=macosx*] = $(ARCHS_STANDARD_32_64_BIT)
+CODE_SIGN_IDENTITY = -;
+GCC_VERSION = com.apple.compilers.llvm.clang.1_0
+DEBUG_INFORMATION_FORMAT = dwarf-with-dsym
+
+DEAD_CODE_STRIPPING = YES
+
+// Debug symbols should be on obviously
+GCC_GENERATE_DEBUGGING_SYMBOLS = YES
+COPY_PHASE_STRIP = NO
+STRIP_STYLE = debugging
+STRIP_INSTALLED_PRODUCT = NO
+
+WARNING_CFLAGS = -Wno-deprecated-declarations $(inherited)
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) CORECRYPTO_DONOT_USE_TRANSPARENT_UNION=1
+
